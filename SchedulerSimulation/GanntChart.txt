@@ -1,0 +1,10 @@
+GANNT CHART:
+Wall time at start: 1646256837184
+BurstStart	BurstEnd	JOB
+0		3		IDLE
+4		210		1
+210		305		IDLE
+306		614		2
+615		927		3
+927		1240		4
+1240		1240		FINISHED
