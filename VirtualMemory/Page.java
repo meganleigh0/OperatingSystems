@@ -1,5 +1,5 @@
 # ============================================================
-# EVMS Pipeline – Standard-format Cobra files (fuzzy cost-sets)
+# EVMS Pipeline – Standard-format Cobra files (with theme + subteam EVMS detail)
 # ============================================================
 
 import os
@@ -19,7 +19,7 @@ from pptx.util import Inches, Pt
 
 DATA_DIR   = "data"
 OUTPUT_DIR = "EVMS_Output"
-PPTX_TEMPLATE = None   # or path to a .pptx template if you have one
+THEME_PATH = os.path.join(DATA_DIR, "Theme.pptx")   # your GDLS theme file
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -109,7 +109,6 @@ def compute_ev_timeseries(cobra: pd.DataFrame) -> pd.DataFrame:
     if ev.empty:
         raise ValueError("No BCWS/BCWP/ACWP rows found after mapping COSTSET")
 
-    # Pivot daily sums by logical costset
     pivot = (
         ev.pivot_table(
             index="DATE",
@@ -124,7 +123,7 @@ def compute_ev_timeseries(cobra: pd.DataFrame) -> pd.DataFrame:
         if cs not in pivot.columns:
             pivot[cs] = 0.0
 
-    # Monthly totals at month-end (ME is the non-deprecated alias)
+    # Monthly totals at month-end (ME is non-deprecated alias for M)
     monthly = pivot.resample("ME").sum()
 
     acwp = monthly[ACWP_CODE].replace(0, np.nan)
@@ -187,6 +186,68 @@ def build_program_metric_table(evdf: pd.DataFrame) -> tuple[pd.DataFrame, dateti
         )
 
     return pd.DataFrame(rows), ctd_date, lsd_date
+
+
+def build_subteam_metric_table(cobra: pd.DataFrame,
+                               ctd_date: datetime,
+                               lsd_date: datetime) -> pd.DataFrame:
+    """
+    Sub-team EVMS metrics (SPI/CPI, CTD/LSD).
+    CTD = cumulative SPI/CPI at/through CTD date.
+    LSD = monthly SPI/CPI at LSD date.
+    """
+    subteams = sorted(cobra["SUBTEAM"].dropna().astype(str).unique())
+    rows = []
+
+    for st in subteams:
+        sub_df = cobra[cobra["SUBTEAM"] == st]
+        try:
+            ev_sub = compute_ev_timeseries(sub_df)
+        except ValueError:
+            # If we can't compute EV for this subteam, leave as NaN
+            rows.append(
+                {
+                    "Sub Team": st,
+                    "SPI CTD": np.nan,
+                    "SPI LSD": np.nan,
+                    "CPI CTD": np.nan,
+                    "CPI LSD": np.nan,
+                    "Comments / Root Cause & Corrective Actions": "",
+                }
+            )
+            continue
+
+        ev_ctd = ev_sub[ev_sub["DATE"] <= ctd_date]
+        ev_lsd = ev_sub[ev_sub["DATE"] <= lsd_date]
+
+        if ev_ctd.empty or ev_lsd.empty:
+            rows.append(
+                {
+                    "Sub Team": st,
+                    "SPI CTD": np.nan,
+                    "SPI LSD": np.nan,
+                    "CPI CTD": np.nan,
+                    "CPI LSD": np.nan,
+                    "Comments / Root Cause & Corrective Actions": "",
+                }
+            )
+            continue
+
+        ctd_row = ev_ctd.iloc[-1]
+        lsd_row = ev_lsd.iloc[-1]
+
+        rows.append(
+            {
+                "Sub Team": st,
+                "SPI CTD": float(ctd_row["SPI_CUM"]) if pd.notna(ctd_row["SPI_CUM"]) else np.nan,
+                "SPI LSD": float(lsd_row["SPI_M"]) if pd.notna(lsd_row["SPI_M"]) else np.nan,
+                "CPI CTD": float(ctd_row["CPI_CUM"]) if pd.notna(ctd_row["CPI_CUM"]) else np.nan,
+                "CPI LSD": float(lsd_row["CPI_M"]) if pd.notna(lsd_row["CPI_M"]) else np.nan,
+                "Comments / Root Cause & Corrective Actions": "",
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 # ------------------------------------------------------------
@@ -271,17 +332,14 @@ def make_ev_plot(evdf: pd.DataFrame, program_name: str, out_png: str):
     plt.close("all")
     fig, ax = plt.subplots(figsize=(7, 4))
 
-    # Color bands
     add_color_band(ax, YMIN, 0.95, "red")
     add_color_band(ax, 0.95, 0.98, "yellow")
     add_color_band(ax, 0.98, 1.05, "green")
     add_color_band(ax, 1.05, YMAX, "lightblue")
 
-    # Monthly scatter
     ax.scatter(plot_df["DATE"], plot_df["CPI_M"], s=15, label="Monthly CPI")
     ax.scatter(plot_df["DATE"], plot_df["SPI_M"], s=15, label="Monthly SPI")
 
-    # Cumulative lines
     ax.plot(plot_df["DATE"], plot_df["CPI_CUM"], linewidth=2, label="Cumulative CPI")
     ax.plot(plot_df["DATE"], plot_df["SPI_CUM"], linewidth=2, label="Cumulative SPI")
 
@@ -298,7 +356,7 @@ def make_ev_plot(evdf: pd.DataFrame, program_name: str, out_png: str):
 
 
 # ------------------------------------------------------------
-# PowerPoint layout helpers
+# PowerPoint helpers
 # ------------------------------------------------------------
 
 def remove_click_to_add_text_boxes(slide):
@@ -313,7 +371,7 @@ def remove_click_to_add_text_boxes(slide):
 
 def add_overview_slide(prs, program_name, ev_plot_png, metrics_df, ctd_date, lsd_date):
     """Slide 1: trend plot + SPI/CPI overview table."""
-    layout = prs.slide_layouts[1]  # title + content
+    layout = prs.slide_layouts[1]  # title + content from Theme.pptx
     slide = prs.slides.add_slide(layout)
     remove_click_to_add_text_boxes(slide)
 
@@ -336,18 +394,18 @@ def add_overview_slide(prs, program_name, ev_plot_png, metrics_df, ctd_date, lsd
 
     tbl_left = Inches(6.0)
     tbl_top = Inches(1.4)
-    tbl_width = Inches(4.6)
-    tbl_height = Inches(1.7)
+    tbl_width = Inches(4.8)
+    tbl_height = Inches(1.8)
 
     tbl_shape = slide.shapes.add_table(rows, cols, tbl_left, tbl_top,
                                        tbl_width, tbl_height)
     tbl = tbl_shape.table
 
     # Column widths (Metric wider, Comments widest)
-    tbl.columns[0].width = Inches(1.2)
-    tbl.columns[1].width = Inches(1.0)
-    tbl.columns[2].width = Inches(1.0)
-    tbl.columns[3].width = Inches(1.4)
+    tbl.columns[0].width = Inches(1.3)  # Metric
+    tbl.columns[1].width = Inches(1.1)  # CTD
+    tbl.columns[2].width = Inches(1.1)  # LSD
+    tbl.columns[3].width = Inches(1.3)  # Comments
 
     headers = ["Metric", "CTD", "LSD", "Comments / Root Cause & Corrective Actions"]
     for j, h in enumerate(headers):
@@ -357,12 +415,72 @@ def add_overview_slide(prs, program_name, ev_plot_png, metrics_df, ctd_date, lsd
         tbl.cell(i, 0).text = str(row["Metric"])
         tbl.cell(i, 1).text = f"{row['CTD']:.3f}" if pd.notna(row["CTD"]) else ""
         tbl.cell(i, 2).text = f"{row['LSD']:.3f}" if pd.notna(row["LSD"]) else ""
-        tbl.cell(i, 3).text = ""  # comments to be filled manually
+        tbl.cell(i, 3).text = ""  # comments
+
+
+def add_subteam_evms_slide(prs, program_name, sub_metrics_df,
+                           page_idx: int, total_pages: int):
+    """Slides: sub-team EVMS metrics (SPI/CPI CTD/LSD)."""
+    layout = prs.slide_layouts[1]
+    slide = prs.slides.add_slide(layout)
+    remove_click_to_add_text_boxes(slide)
+
+    if total_pages > 1:
+        title = f"{program_name} EVMS Detail – Sub Team EVMS Metrics (Page {page_idx+1})"
+    else:
+        title = f"{program_name} EVMS Detail – Sub Team EVMS Metrics"
+    slide.shapes.title.text = title
+
+    start = page_idx * SUBTEAMS_PER_SLIDE
+    end = (page_idx + 1) * SUBTEAMS_PER_SLIDE
+    sdf = sub_metrics_df.iloc[start:end].reset_index(drop=True)
+
+    cols = [
+        "Sub Team",
+        "SPI CTD",
+        "SPI LSD",
+        "CPI CTD",
+        "CPI LSD",
+        "Comments / Root Cause & Corrective Actions",
+    ]
+
+    n_rows = len(sdf) + 1
+    n_cols = len(cols)
+
+    left = Inches(0.5)
+    top = Inches(1.4)
+    width = Inches(9.5)
+    height = Inches(4.0)
+
+    shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
+    tbl = shape.table
+
+    # Column widths – comments very wide
+    tbl.columns[0].width = Inches(1.0)
+    tbl.columns[1].width = Inches(1.0)
+    tbl.columns[2].width = Inches(1.0)
+    tbl.columns[3].width = Inches(1.0)
+    tbl.columns[4].width = Inches(1.0)
+    tbl.columns[5].width = Inches(4.5)
+
+    for j, col in enumerate(cols):
+        tbl.cell(0, j).text = col
+
+    for i, (_, row) in enumerate(sdf.iterrows(), start=1):
+        tbl.cell(i, 0).text = str(row["Sub Team"])
+        for j, col in enumerate(cols[1:-1], start=1):
+            val = row[col]
+            if pd.isna(val):
+                txt = ""
+            else:
+                txt = f"{val:.3f}"
+            tbl.cell(i, j).text = txt
+        tbl.cell(i, n_cols - 1).text = ""  # comments
 
 
 def add_labor_manpower_slide(prs, program_name, labor_df, manpower_df,
                              page_idx: int, total_pages: int):
-    """Slide 2+: subteam labor & manpower (15 subteams per slide)."""
+    """Slides: subteam labor & manpower (BAC/EAC/VAC + program manpower)."""
     layout = prs.slide_layouts[1]
     slide = prs.slides.add_slide(layout)
     remove_click_to_add_text_boxes(slide)
@@ -391,8 +509,8 @@ def add_labor_manpower_slide(prs, program_name, labor_df, manpower_df,
 
     top_left = Inches(0.5)
     top_top = Inches(1.4)
-    top_width = Inches(9.0)
-    top_height = Inches(3.6)
+    top_width = Inches(9.5)
+    top_height = Inches(3.5)
 
     labor_shape = slide.shapes.add_table(n_rows, n_cols,
                                          top_left, top_top,
@@ -401,10 +519,10 @@ def add_labor_manpower_slide(prs, program_name, labor_df, manpower_df,
 
     # Column widths – comments very wide
     labor_tbl.columns[0].width = Inches(1.0)
-    labor_tbl.columns[1].width = Inches(1.3)
-    labor_tbl.columns[2].width = Inches(1.3)
-    labor_tbl.columns[3].width = Inches(1.3)
-    labor_tbl.columns[4].width = Inches(4.1)
+    labor_tbl.columns[1].width = Inches(1.4)
+    labor_tbl.columns[2].width = Inches(1.4)
+    labor_tbl.columns[3].width = Inches(1.4)
+    labor_tbl.columns[4].width = Inches(4.3)
 
     for j, col in enumerate(labor_cols):
         labor_tbl.cell(0, j).text = col
@@ -437,7 +555,7 @@ def add_labor_manpower_slide(prs, program_name, labor_df, manpower_df,
 
     pm_left = Inches(0.5)
     pm_top = top_top + top_height + Inches(0.3)
-    pm_width = Inches(9.0)
+    pm_width = Inches(9.5)
     pm_height = Inches(1.1)
 
     pm_shape = slide.shapes.add_table(pm_rows, pm_cols_n,
@@ -446,8 +564,8 @@ def add_labor_manpower_slide(prs, program_name, labor_df, manpower_df,
     pm_tbl = pm_shape.table
 
     for j in range(pm_cols_n - 1):
-        pm_tbl.columns[j].width = Inches(1.2)
-    pm_tbl.columns[pm_cols_n - 1].width = Inches(2.4)
+        pm_tbl.columns[j].width = Inches(1.3)
+    pm_tbl.columns[pm_cols_n - 1].width = Inches(2.3)
 
     for j, col in enumerate(pm_cols):
         pm_tbl.cell(0, j).text = col
@@ -486,6 +604,7 @@ def process_program(program_name: str, cobra_filename: str):
 
     evdf = compute_ev_timeseries(cobra)
     metrics_df, ctd_date, lsd_date = build_program_metric_table(evdf)
+    sub_metrics_df = build_subteam_metric_table(cobra, ctd_date, lsd_date)
     labor_df = build_labor_table(cobra)
     manpower_df = build_manpower_table(cobra)
 
@@ -498,21 +617,30 @@ def process_program(program_name: str, cobra_filename: str):
     with pd.ExcelWriter(tables_xlsx, engine="xlsxwriter") as writer:
         evdf.to_excel(writer, sheet_name="EV_Series", index=False)
         metrics_df.to_excel(writer, sheet_name="Program_Metrics", index=False)
+        sub_metrics_df.to_excel(writer, sheet_name="Subteam_EVMS", index=False)
         labor_df.to_excel(writer, sheet_name="Subteam_Labor", index=False)
         manpower_df.to_excel(writer, sheet_name="Program_Manpower", index=False)
 
-    # Deck
-    if PPTX_TEMPLATE and os.path.exists(PPTX_TEMPLATE):
-        prs = Presentation(PPTX_TEMPLATE)
+    # Deck using Theme.pptx
+    if os.path.exists(THEME_PATH):
+        prs = Presentation(THEME_PATH)
     else:
         prs = Presentation()
 
+    # 1) Overview slide
     add_overview_slide(prs, program_name, ev_plot_png, metrics_df, ctd_date, lsd_date)
 
-    n_pages = max(1, math.ceil(len(labor_df) / SUBTEAMS_PER_SLIDE))
-    for page_idx in range(n_pages):
+    # 2) Sub-team EVMS detail slides
+    n_ev_pages = max(1, math.ceil(len(sub_metrics_df) / SUBTEAMS_PER_SLIDE))
+    for page_idx in range(n_ev_pages):
+        add_subteam_evms_slide(prs, program_name, sub_metrics_df,
+                               page_idx, n_ev_pages)
+
+    # 3) Sub-team labor & manpower slides
+    n_labor_pages = max(1, math.ceil(len(labor_df) / SUBTEAMS_PER_SLIDE))
+    for page_idx in range(n_labor_pages):
         add_labor_manpower_slide(prs, program_name, labor_df, manpower_df,
-                                 page_idx, n_pages)
+                                 page_idx, n_labor_pages)
 
     out_pptx = os.path.join(OUTPUT_DIR, f"{program_name}_EVMS_Deck.pptx")
     prs.save(out_pptx)
