@@ -1,9 +1,4 @@
-# ============================================================
-# EVMS Pipeline – Standard-format Cobra files (with theme + subteam EVMS detail)
-# ============================================================
-
 import os
-import math
 from datetime import datetime
 
 import numpy as np
@@ -12,18 +7,22 @@ import matplotlib.pyplot as plt
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import PP_PLACEHOLDER
 
-# ------------------------------------------------------------
+# =========================================================
 # CONFIG
-# ------------------------------------------------------------
+# =========================================================
 
-DATA_DIR   = "data"
-OUTPUT_DIR = "EVMS_Output"
-THEME_PATH = os.path.join(DATA_DIR, "Theme.pptx")   # your GDLS theme file
+COBRA_DIR   = "data"
+PENSKE_PATH = os.path.join("data", "OpenPlan_Activity-Penske.xlsx")
+THEME_PATH  = os.path.join("data", "Theme.pptx")
+OUTPUT_DIR  = "EVMS_Output"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Programs whose Cobra exports use the standard layout (SUBTEAM/COSTSET/DATE/HOURS)
+# Only programs that share the “standard” Cobra format
 PROGRAM_CONFIG = {
     "Abrams_STS_2022": "Cobra-Abrams STS 2022.xlsx",
     "Abrams_STS"     : "Cobra-Abrams STS.xlsx",
@@ -33,632 +32,722 @@ PROGRAM_CONFIG = {
     "XM30"           : "Cobra-XM30.xlsx",
 }
 
-# Column name normalization
-COBRA_COLUMN_MAP = {
-    "SUB_TEAM": "SUBTEAM",
-    "SUBTEAM": "SUBTEAM",
-    "COST-SET": "COSTSET",
-    "COSTSET": "COSTSET",
-    "DATE": "DATE",
-    "HOURS": "HOURS",
-}
-
-# Logical cost-set labels
-ACWP_CODE = "ACWP"
-BCWP_CODE = "BCWP"
-BCWS_CODE = "BCWS"
-ETC_CODE  = "ETC"
-
-SUBTEAMS_PER_SLIDE = 15
-
-# EV plot y-range
+# EV index bands and colors
 YMIN, YMAX = 0.75, 1.25
+RED_MIN, RED_MAX       = 0.90, 0.95
+YELLOW_MIN, YELLOW_MAX = 0.95, 0.98
+GREEN_MIN, GREEN_MAX   = 0.98, 1.05
+BLUE_MIN, BLUE_MAX     = 1.05, 1.25
 
-# ------------------------------------------------------------
-# Normalisation & cost-set mapping
-# ------------------------------------------------------------
+# Color constants for tables (RGB)
+COLOR_RED   = RGBColor(192,   0,   0)
+COLOR_YELLOW= RGBColor(255, 192,   0)
+COLOR_GREEN = RGBColor(  0, 176,  80)
+COLOR_BLUE  = RGBColor( 68, 114, 196)
+COLOR_WHITE = RGBColor(255, 255, 255)
+COLOR_GRAY  = RGBColor(242, 242, 242)
+COLOR_HEADER_BG = RGBColor(31,  73, 125)
+COLOR_HEADER_TX = RGBColor(255,255,255)
 
-def normalize_cobra_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardise key columns and add COSTSET_LOGIC based on fuzzy mapping."""
-    # Rename to logical names
-    col_map = {}
-    for raw, logical in COBRA_COLUMN_MAP.items():
-        if raw in df.columns:
-            col_map[raw] = logical
-    df = df.rename(columns=col_map)
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
 
-    required = ["SUBTEAM", "COSTSET", "DATE", "HOURS"]
-    missing = [c for c in required if c not in df.columns]
+def find_col(cols, *keywords):
+    """
+    Find first column whose name contains all keywords (case/space insensitive).
+    """
+    for c in cols:
+        name = c.replace(" ", "").upper()
+        if all(k.upper() in name for k in keywords):
+            return c
+    return None
+
+def normalize_cobra_standard(path):
+    """
+    Load a Cobra file that follows the 'standard' format used by XM30 / Abrams / etc.
+    Returns a DataFrame with columns: SUBTEAM, COSTSET, DATE, HOURS.
+    Raises ValueError if required columns not found.
+    """
+    df = pd.read_excel(path)
+
+    subteam_col = find_col(df.columns, "SUB", "TEAM")
+    costset_col = find_col(df.columns, "COST", "SET")
+    date_col    = find_col(df.columns, "DATE")
+    hours_col   = find_col(df.columns, "HOUR")
+
+    missing = [n for n, c in
+               [("SUBTEAM",subteam_col),("COSTSET",costset_col),
+                ("DATE",date_col),("HOURS",hours_col)]
+               if c is None]
     if missing:
-        raise ValueError(f"Could not normalise Cobra file – missing logical columns: {missing}")
+        raise ValueError(f"Missing logical columns in Cobra file: {missing}")
+
+    df = df[[subteam_col, costset_col, date_col, hours_col]].copy()
+    df.columns = ["SUBTEAM", "COSTSET", "DATE", "HOURS"]
 
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df = df.dropna(subset=["SUBTEAM","COSTSET","DATE","HOURS"])
+
+    # Ensure numeric hours
     df["HOURS"] = pd.to_numeric(df["HOURS"], errors="coerce")
-    df = df.dropna(subset=["DATE", "HOURS"])
+    df = df.dropna(subset=["HOURS"])
 
-    df["SUBTEAM"] = df["SUBTEAM"].astype(str).str.strip()
-    df["COSTSET"] = df["COSTSET"].astype(str).str.strip()
-
-    # Fuzzy mapping from raw COSTSET → logical COSTSET_LOGIC
-    def logical_from_raw(val: str):
-        s = str(val).upper()
-        if "ACWP" in s:
-            return ACWP_CODE
-        if "BCWP" in s:
-            return BCWP_CODE
-        # Treat “BCWS”, “BUDGET”, “BAC” as budget (BCWS)
-        if ("BCWS" in s) or ("BUDG" in s) or ("BAC" in s):
-            return BCWS_CODE
-        if "ETC" in s or "REMAIN" in s:
-            return ETC_CODE
-        return None
-
-    df["COSTSET_LOGIC"] = df["COSTSET"].map(logical_from_raw)
+    # Standardize cost-set labels
+    df["COSTSET"] = df["COSTSET"].astype(str).str.strip().str.upper()
 
     return df
 
+# =========================================================
+# EVMS CALCULATIONS
+# =========================================================
 
-# ------------------------------------------------------------
-# EV time series & metrics
-# ------------------------------------------------------------
-
-def compute_ev_timeseries(cobra: pd.DataFrame) -> pd.DataFrame:
-    """Compute monthly & cumulative CPI/SPI at month-end."""
-    mask = cobra["COSTSET_LOGIC"].isin([ACWP_CODE, BCWP_CODE, BCWS_CODE])
-    ev = cobra.loc[mask].copy()
+def compute_ev_timeseries(cobra_df):
+    """
+    Compute monthly & cumulative SPI/CPI timeseries from normalized Cobra df.
+    Returns DataFrame indexed by month (datetime), with columns:
+    BCWS, BCWP, ACWP, SPI_M, CPI_M, SPI_CUM, CPI_CUM
+    """
+    ev = cobra_df[cobra_df["COSTSET"].isin(["BCWS","BCWP","ACWP"])].copy()
     if ev.empty:
-        raise ValueError("No BCWS/BCWP/ACWP rows found after mapping COSTSET")
+        raise ValueError("No BCWS/BCWP/ACWP rows found for this dataset")
 
-    pivot = (
-        ev.pivot_table(
-            index="DATE",
-            columns="COSTSET_LOGIC",
-            values="HOURS",
-            aggfunc="sum"
-        )
-        .sort_index()
-    )
+    ev = ev.groupby(["DATE","COSTSET"])["HOURS"].sum().unstack("COSTSET")
+    # Resample to month-start frequency and sum within month
+    ev = ev.resample("MS").sum()
 
-    for cs in (ACWP_CODE, BCWP_CODE, BCWS_CODE):
-        if cs not in pivot.columns:
-            pivot[cs] = 0.0
+    # Cumulative sums
+    cum = ev.cumsum()
 
-    # Monthly totals at month-end (ME is non-deprecated alias for M)
-    monthly = pivot.resample("ME").sum()
+    bcws = ev.get("BCWS")
+    bcwp = ev.get("BCWP")
+    acwp = ev.get("ACWP")
 
-    acwp = monthly[ACWP_CODE].replace(0, np.nan)
-    bcwp = monthly[BCWP_CODE]
-    bcws = monthly[BCWS_CODE].replace(0, np.nan)
+    # Monthly indices
+    spi_m = bcwp / bcws.replace(0, np.nan)
+    cpi_m = bcwp / acwp.replace(0, np.nan)
 
-    monthly_cpi = bcwp / acwp
-    monthly_spi = bcwp / bcws
+    # Cumulative indices
+    spi_c = cum.get("BCWP") / cum.get("BCWS").replace(0, np.nan)
+    cpi_c = cum.get("BCWP") / cum.get("ACWP").replace(0, np.nan)
 
-    # Cumulative
-    cum = pivot.cumsum().resample("ME").last()
-    acwp_c = cum[ACWP_CODE].replace(0, np.nan)
-    bcwp_c = cum[BCWP_CODE]
-    bcws_c = cum[BCWS_CODE].replace(0, np.nan)
-
-    cum_cpi = bcwp_c / acwp_c
-    cum_spi = bcwp_c / bcws_c
-
-    evdf = pd.DataFrame(
-        {
-            "DATE": monthly.index,
-            "CPI_M": monthly_cpi.values,
-            "SPI_M": monthly_spi.values,
-            "CPI_CUM": cum_cpi.reindex(monthly.index).values,
-            "SPI_CUM": cum_spi.reindex(monthly.index).values,
-        }
-    ).dropna(subset=["CPI_M", "SPI_M"], how="all")
+    evdf = pd.DataFrame({
+        "BCWS": bcws,
+        "BCWP": bcwp,
+        "ACWP": acwp,
+        "SPI_M": spi_m,
+        "CPI_M": cpi_m,
+        "SPI_CUM": spi_c,
+        "CPI_CUM": cpi_c,
+    }).dropna(how="all")
 
     return evdf
 
-
-def get_ctd_lsd(evdf: pd.DataFrame):
-    """For now, use latest month-end as both CTD and LSD."""
-    if evdf.empty:
-        raise ValueError("EV time series is empty")
-    ctd_date = evdf["DATE"].max()
+def get_status_date(evdf):
+    """
+    Simple CTD/LSD status date using latest non-null SPI_CUM.
+    For now CTD and LSD are the same (can be refined when Penske mapping is added).
+    """
+    valid = evdf["SPI_CUM"].dropna()
+    if valid.empty:
+        raise ValueError("No valid SPI_CUM values to determine status date")
+    ctd_date = valid.index[-1]
     lsd_date = ctd_date
     return ctd_date, lsd_date
 
-
-def build_program_metric_table(evdf: pd.DataFrame) -> tuple[pd.DataFrame, datetime, datetime]:
-    """Build top-level SPI/CPI CTD/LSD table (no BEI)."""
-    ctd_date, lsd_date = get_ctd_lsd(evdf)
-
-    ev_ctd = evdf.loc[evdf["DATE"] == ctd_date].iloc[-1]
-    ev_lsd = evdf.loc[evdf["DATE"] == lsd_date].iloc[-1]
-
-    rows = []
-    for metric, ctd_val, lsd_val in [
-        ("SPI", ev_ctd["SPI_CUM"], ev_lsd["SPI_M"]),
-        ("CPI", ev_ctd["CPI_CUM"], ev_lsd["CPI_M"]),
-    ]:
-        rows.append(
-            {
-                "Metric": metric,
-                "CTD": float(ctd_val) if pd.notna(ctd_val) else np.nan,
-                "LSD": float(lsd_val) if pd.notna(lsd_val) else np.nan,
-                "Comments / Root Cause & Corrective Actions": "",
-            }
-        )
-
-    return pd.DataFrame(rows), ctd_date, lsd_date
-
-
-def build_subteam_metric_table(cobra: pd.DataFrame,
-                               ctd_date: datetime,
-                               lsd_date: datetime) -> pd.DataFrame:
+def build_program_metric_table(evdf, ctd_date, lsd_date):
     """
-    Sub-team EVMS metrics (SPI/CPI, CTD/LSD).
-    CTD = cumulative SPI/CPI at/through CTD date.
-    LSD = monthly SPI/CPI at LSD date.
+    Program-level SPI/CPI CTD/LSD table (BEI omitted for now).
     """
-    subteams = sorted(cobra["SUBTEAM"].dropna().astype(str).unique())
-    rows = []
-
-    for st in subteams:
-        sub_df = cobra[cobra["SUBTEAM"] == st]
+    def get_val(series, dt):
         try:
-            ev_sub = compute_ev_timeseries(sub_df)
-        except ValueError:
-            # If we can't compute EV for this subteam, leave as NaN
-            rows.append(
-                {
-                    "Sub Team": st,
-                    "SPI CTD": np.nan,
-                    "SPI LSD": np.nan,
-                    "CPI CTD": np.nan,
-                    "CPI LSD": np.nan,
-                    "Comments / Root Cause & Corrective Actions": "",
-                }
-            )
+            return float(series.loc[dt])
+        except Exception:
+            return np.nan
+
+    spi_ctd = get_val(evdf["SPI_CUM"], ctd_date)
+    cpi_ctd = get_val(evdf["CPI_CUM"], ctd_date)
+    spi_lsd = get_val(evdf["SPI_CUM"], lsd_date)
+    cpi_lsd = get_val(evdf["CPI_CUM"], lsd_date)
+
+    metric_df = pd.DataFrame({
+        "Metric": ["SPI","CPI"],
+        "CTD": [spi_ctd, cpi_ctd],
+        "LSD": [spi_lsd, cpi_lsd],
+        "Comments / Root Cause & Corrective Actions": ["",""],
+    })
+
+    return metric_df
+
+def build_subteam_metric_table(cobra_df, ctd_date, lsd_date):
+    """
+    Sub-team level SPI/CPI CTD/LSD (no BEI right now).
+    Returns DataFrame: SUBTEAM, SPI_CTD, SPI_LSD, CPI_CTD, CPI_LSD, Comments...
+    """
+    ev = cobra_df[cobra_df["COSTSET"].isin(["BCWS","BCWP","ACWP"])].copy()
+    if ev.empty:
+        return pd.DataFrame(columns=[
+            "Sub Team","SPI CTD","SPI LSD","CPI CTD","CPI LSD",
+            "Comments / Root Cause & Corrective Actions"
+        ])
+
+    ev["DATE"] = pd.to_datetime(ev["DATE"])
+
+    ctd_mask = ev["DATE"] <= ctd_date
+    lsd_mask = ev["DATE"] <= lsd_date
+
+    grp_ctd = ev[ctd_mask].groupby(["SUBTEAM","COSTSET"])["HOURS"].sum().unstack("COSTSET")
+    grp_lsd = ev[lsd_mask].groupby(["SUBTEAM","COSTSET"])["HOURS"].sum().unstack("COSTSET")
+
+    subteams = sorted(ev["SUBTEAM"].unique())
+    rows = []
+    for st in subteams:
+        g_ctd = grp_ctd.loc[st] if st in grp_ctd.index else pd.Series(dtype=float)
+        g_lsd = grp_lsd.loc[st] if st in grp_lsd.index else pd.Series(dtype=float)
+
+        bcwp_ctd = g_ctd.get("BCWP", np.nan)
+        bcws_ctd = g_ctd.get("BCWS", np.nan)
+        acwp_ctd = g_ctd.get("ACWP", np.nan)
+
+        bcwp_lsd = g_lsd.get("BCWP", np.nan)
+        bcws_lsd = g_lsd.get("BCWS", np.nan)
+        acwp_lsd = g_lsd.get("ACWP", np.nan)
+
+        spi_ctd = bcwp_ctd / bcws_ctd if bcws_ctd not in (0, np.nan) else np.nan
+        cpi_ctd = bcwp_ctd / acwp_ctd if acwp_ctd not in (0, np.nan) else np.nan
+        spi_lsd = bcwp_lsd / bcws_lsd if bcws_lsd not in (0, np.nan) else np.nan
+        cpi_lsd = bcwp_lsd / acwp_lsd if acwp_lsd not in (0, np.nan) else np.nan
+
+        if all(pd.isna([spi_ctd, cpi_ctd, spi_lsd, cpi_lsd])):
+            # Skip totally empty subteams
             continue
 
-        ev_ctd = ev_sub[ev_sub["DATE"] <= ctd_date]
-        ev_lsd = ev_sub[ev_sub["DATE"] <= lsd_date]
+        rows.append([st, spi_ctd, spi_lsd, cpi_ctd, cpi_lsd, ""])
 
-        if ev_ctd.empty or ev_lsd.empty:
-            rows.append(
-                {
-                    "Sub Team": st,
-                    "SPI CTD": np.nan,
-                    "SPI LSD": np.nan,
-                    "CPI CTD": np.nan,
-                    "CPI LSD": np.nan,
-                    "Comments / Root Cause & Corrective Actions": "",
-                }
-            )
-            continue
+    sub_df = pd.DataFrame(rows, columns=[
+        "Sub Team","SPI CTD","SPI LSD","CPI CTD","CPI LSD",
+        "Comments / Root Cause & Corrective Actions"
+    ])
 
-        ctd_row = ev_ctd.iloc[-1]
-        lsd_row = ev_lsd.iloc[-1]
+    return sub_df
 
-        rows.append(
-            {
-                "Sub Team": st,
-                "SPI CTD": float(ctd_row["SPI_CUM"]) if pd.notna(ctd_row["SPI_CUM"]) else np.nan,
-                "SPI LSD": float(lsd_row["SPI_M"]) if pd.notna(lsd_row["SPI_M"]) else np.nan,
-                "CPI CTD": float(ctd_row["CPI_CUM"]) if pd.notna(ctd_row["CPI_CUM"]) else np.nan,
-                "CPI LSD": float(lsd_row["CPI_M"]) if pd.notna(lsd_row["CPI_M"]) else np.nan,
-                "Comments / Root Cause & Corrective Actions": "",
-            }
-        )
+def build_labor_table(cobra_df):
+    """
+    Sub-team labor table with BAC, EAC, VAC:
+    EAC = ACWP + ETC, VAC = BAC - EAC
+    """
+    labor = cobra_df[cobra_df["COSTSET"].isin(["BAC","ACWP","ETC"])].copy()
+    if labor.empty:
+        return pd.DataFrame(columns=["Sub Team","BAC","EAC","VAC",
+                                     "Comments / Root Cause & Corrective Actions"])
 
-    return pd.DataFrame(rows)
+    pivot = labor.pivot_table(index=["SUBTEAM","COSTSET"], values="HOURS", aggfunc="sum").unstack("COSTSET")
+    pivot.columns = pivot.columns.get_level_values(1)
 
+    bac = pivot.get("BAC", pd.Series(dtype=float))
+    acwp = pivot.get("ACWP", pd.Series(dtype=float)).fillna(0.0)
+    etc  = pivot.get("ETC",  pd.Series(dtype=float)).fillna(0.0)
 
-# ------------------------------------------------------------
-# Labor & manpower tables
-# ------------------------------------------------------------
+    eac = acwp + etc
+    vac = bac - eac
 
-def build_labor_table(cobra: pd.DataFrame) -> pd.DataFrame:
-    """Subteam BAC/EAC/VAC table using logical cost-sets."""
-    mask = cobra["COSTSET_LOGIC"].isin([ACWP_CODE, BCWP_CODE, BCWS_CODE, ETC_CODE])
-    df = cobra.loc[mask].copy()
+    df = pd.DataFrame({
+        "Sub Team": pivot.index,
+        "BAC": bac,
+        "EAC": eac,
+        "VAC": vac,
+        "Comments / Root Cause & Corrective Actions": ""
+    })
 
-    pivot = (
-        df.pivot_table(
-            index="SUBTEAM",
-            columns="COSTSET_LOGIC",
-            values="HOURS",
-            aggfunc="sum"
-        )
-        .fillna(0.0)
-    )
+    return df
 
-    pivot["BAC"] = pivot.get(BCWS_CODE, 0.0)
-    pivot["EAC"] = pivot.get(ACWP_CODE, 0.0) + pivot.get(ETC_CODE, 0.0)
-    pivot["VAC"] = pivot["BAC"] - pivot["EAC"]
+def build_manpower_table(penske_df, program_name):
+    """
+    Program Manpower summary from Penske data.
+    If Penske file missing or no rows for program, returns NaNs but still
+    produces one-row table so layout doesn't break.
+    """
+    if penske_df is None:
+        return pd.DataFrame([{
+            "Demand Hours": np.nan,
+            "Actual Hours": np.nan,
+            "% Var": np.nan,
+            "Next Mo BCWS Hours": np.nan,
+            "Next Mo ETC Hours": np.nan,
+            "Comments / Root Cause & Corrective Actions": ""
+        }])
 
-    out = (
-        pivot[["BAC", "EAC", "VAC"]]
-        .reset_index()
-        .rename(columns={"SUBTEAM": "Sub Team"})
-    )
-    out["Comments / Root Cause & Corrective Actions"] = ""
-    return out
+    df = penske_df.copy()
+    if "Program" in df.columns:
+        prog_col = "Program"
+    elif "PROGRAM" in df.columns:
+        prog_col = "PROGRAM"
+    else:
+        prog_col = None
 
+    if prog_col is not None:
+        pdf = df[df[prog_col].astype(str).str.upper().str.contains(program_name.upper())]
+    else:
+        pdf = df
 
-def build_manpower_table(cobra: pd.DataFrame) -> pd.DataFrame:
-    """Program-level manpower summary (simple version)."""
-    mask = cobra["COSTSET_LOGIC"].isin([BCWS_CODE, ACWP_CODE, ETC_CODE])
-    df = cobra.loc[mask].copy()
+    if pdf.empty:
+        return pd.DataFrame([{
+            "Demand Hours": np.nan,
+            "Actual Hours": np.nan,
+            "% Var": np.nan,
+            "Next Mo BCWS Hours": np.nan,
+            "Next Mo ETC Hours": np.nan,
+            "Comments / Root Cause & Corrective Actions": ""
+        }])
 
-    agg = (
-        df.pivot_table(
-            index="COSTSET_LOGIC",
-            values="HOURS",
-            aggfunc="sum"
-        )
-        .to_dict()
-        .get("HOURS", {})
-    )
+    # These column names depend on your Penske export; adjust if needed.
+    # For now assume:
+    #   'Demand Hours' (planned), 'Hours' (actual), 'Next_Month_BCWS', 'Next_Month_ETC'
+    demand_col = find_col(pdf.columns, "DEMAND","HOUR")
+    actual_col = find_col(pdf.columns, "HOUR")  # actual
+    bcws_col   = find_col(pdf.columns, "BCWS")
+    etc_col    = find_col(pdf.columns, "ETC")
 
-    demand_hours = float(agg.get(BCWS_CODE, 0.0))
-    actual_hours = float(agg.get(ACWP_CODE, 0.0))
-    pct_var = (actual_hours / demand_hours) if demand_hours else np.nan
+    demand = pdf[demand_col].sum() if demand_col else np.nan
+    actual = pdf[actual_col].sum() if actual_col else np.nan
+    bcws   = pdf[bcws_col].sum()   if bcws_col   else np.nan
+    etc    = pdf[etc_col].sum()    if etc_col    else np.nan
 
-    return pd.DataFrame(
-        [
-            {
-                "Demand Hours": demand_hours,
-                "Actual Hours": actual_hours,
-                "% Var": pct_var,
-                "Next Mo BCWS Hours": 0.0,
-                "Next Mo ETC Hours": 0.0,
-                "Comments / Root Cause & Corrective Actions": "",
-            }
-        ]
-    )
+    pct_var = actual / demand if demand not in (0, np.nan) else np.nan
 
+    mp = pd.DataFrame([{
+        "Demand Hours": demand,
+        "Actual Hours": actual,
+        "% Var": pct_var,
+        "Next Mo BCWS Hours": bcws,
+        "Next Mo ETC Hours": etc,
+        "Comments / Root Cause & Corrective Actions": ""
+    }])
 
-# ------------------------------------------------------------
-# Plotting
-# ------------------------------------------------------------
+    return mp
 
-def add_color_band(ax, y0, y1, color):
-    ax.axhspan(y0, y1, facecolor=color, alpha=0.3, linewidth=0)
+# =========================================================
+# COLOR CODING HELPERS
+# =========================================================
 
+def ev_index_color(val):
+    """Color for CPI/SPI based on 0.90 / 0.95 / 0.98 / 1.05 thresholds."""
+    if pd.isna(val):
+        return None
+    if val >= BLUE_MIN:
+        return COLOR_BLUE
+    elif val >= GREEN_MIN:
+        return COLOR_GREEN
+    elif val >= YELLOW_MIN:
+        return COLOR_YELLOW
+    elif val >= RED_MIN:
+        return COLOR_RED
+    else:
+        return COLOR_RED
 
-def make_ev_plot(evdf: pd.DataFrame, program_name: str, out_png: str):
-    """Create EVMS trend plot with clipped indices and color bands."""
+def vac_color(vac, bac):
+    """
+    Color for VAC/BAC:
+        Blue  >= +5%
+        Green +1% to +5%
+        Yellow -1% to +1%
+        Red   < -1%
+    """
+    if pd.isna(vac) or pd.isna(bac) or bac == 0:
+        return None
+    ratio = vac / bac
+    if ratio >= 0.05:
+        return COLOR_BLUE
+    elif ratio >= 0.01:
+        return COLOR_GREEN
+    elif ratio >= -0.01:
+        return COLOR_YELLOW
+    else:
+        return COLOR_RED
+
+def manpower_var_color(pct):
+    """
+    Color for manpower % Var:
+        Green  90–105%
+        Yellow 85–90% or 105–110%
+        Red    <85% or >110%
+    """
+    if pd.isna(pct):
+        return None
+    if 0.90 <= pct <= 1.05:
+        return COLOR_GREEN
+    elif 0.85 <= pct < 0.90 or 1.05 < pct <= 1.10:
+        return COLOR_YELLOW
+    else:
+        return COLOR_RED
+
+# =========================================================
+# PLOTTING
+# =========================================================
+
+def make_evms_plot(evdf, program_name, out_png):
+    """
+    Create EVMS trend plot with color bands and SPI/CPI monthly + cumulative.
+    """
     plot_df = evdf.copy()
-    for col in ["CPI_M", "SPI_M", "CPI_CUM", "SPI_CUM"]:
+    # Clip for plotting only (keeps cumulative smooth but avoids crazy spikes)
+    for col in ["SPI_M","CPI_M","SPI_CUM","CPI_CUM"]:
         plot_df[col] = plot_df[col].clip(lower=YMIN, upper=YMAX)
 
-    plt.close("all")
     fig, ax = plt.subplots(figsize=(7, 4))
 
-    add_color_band(ax, YMIN, 0.95, "red")
-    add_color_band(ax, 0.95, 0.98, "yellow")
-    add_color_band(ax, 0.98, 1.05, "green")
-    add_color_band(ax, 1.05, YMAX, "lightblue")
+    # Color bands
+    ax.axhspan(RED_MIN, RED_MAX,   color="#F4CCCC", zorder=0)   # red band
+    ax.axhspan(YELLOW_MIN, YELLOW_MAX, color="#FFF2CC", zorder=0)
+    ax.axhspan(GREEN_MIN, GREEN_MAX,   color="#D9EAD3", zorder=0)
+    ax.axhspan(BLUE_MIN, YMAX,         color="#D0E0E3", zorder=0)
 
-    ax.scatter(plot_df["DATE"], plot_df["CPI_M"], s=15, label="Monthly CPI")
-    ax.scatter(plot_df["DATE"], plot_df["SPI_M"], s=15, label="Monthly SPI")
+    # Monthly scatter
+    ax.scatter(plot_df.index, plot_df["CPI_M"], s=18, color="black", label="Monthly CPI")
+    ax.scatter(plot_df.index, plot_df["SPI_M"], s=18, color="gold",  label="Monthly SPI")
 
-    ax.plot(plot_df["DATE"], plot_df["CPI_CUM"], linewidth=2, label="Cumulative CPI")
-    ax.plot(plot_df["DATE"], plot_df["SPI_CUM"], linewidth=2, label="Cumulative SPI")
+    # Cumulative lines
+    ax.plot(plot_df.index, plot_df["CPI_CUM"], color="blue",  linewidth=1.8, label="Cumulative CPI")
+    ax.plot(plot_df.index, plot_df["SPI_CUM"], color="gray",  linewidth=1.8, label="Cumulative SPI")
 
     ax.set_ylim(YMIN, YMAX)
-    ax.set_xlabel("Month")
     ax.set_ylabel("EV Indices")
+    ax.set_xlabel("Month")
     ax.set_title(f"{program_name} EVMS Trend Overview")
+
+    ax.grid(True, axis="y", alpha=0.3)
     ax.legend(loc="upper left", fontsize=8)
 
-    fig.autofmt_xdate()
     fig.tight_layout()
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
 
+# =========================================================
+# POWERPOINT HELPERS
+# =========================================================
 
-# ------------------------------------------------------------
-# PowerPoint helpers
-# ------------------------------------------------------------
-
-def remove_click_to_add_text_boxes(slide):
-    """Remove any shape whose text is 'Click to add text' etc."""
+def keep_only_title_placeholder(slide):
+    """
+    Remove every placeholder except TITLE / CENTER_TITLE so we don't see
+    'Click to add text' boxes.
+    """
     for shape in list(slide.shapes):
-        if getattr(shape, "has_text_frame", False):
-            txt = (shape.text_frame.text or "").strip().lower()
-            if txt.startswith("click to add"):
-                el = shape._element
-                el.getparent().remove(el)
+        if not shape.is_placeholder:
+            continue
+        pht = shape.placeholder_format.type
+        if pht not in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
+            slide.shapes._spTree.remove(shape._element)
 
+def style_header_cell(cell):
+    cell.fill.solid()
+    cell.fill.fore_color.rgb = COLOR_HEADER_BG
+    cell.text_frame.clear()
+    p = cell.text_frame.paragraphs[0]
+    p.font.bold = True
+    p.font.size = Pt(12)
+    p.font.color.rgb = COLOR_HEADER_TX
+    p.alignment = PP_ALIGN.CENTER
 
-def add_overview_slide(prs, program_name, ev_plot_png, metrics_df, ctd_date, lsd_date):
-    """Slide 1: trend plot + SPI/CPI overview table."""
-    layout = prs.slide_layouts[1]  # title + content from Theme.pptx
-    slide = prs.slides.add_slide(layout)
-    remove_click_to_add_text_boxes(slide)
+def style_body_cell(cell):
+    cell.text_frame.paragraphs[0].font.size = Pt(10)
 
-    slide.shapes.title.text = f"{program_name} EVMS Trend Overview"
+def add_program_overview_slide(prs, program_name, ev_plot_png, metric_df):
+    """
+    First slide: EVMS trend plot + program level SPI/CPI table.
+    """
+    slide = prs.slides.add_slide(prs.slide_layouts[1])  # title + content
+    keep_only_title_placeholder(slide)
 
-    # Plot on left
-    plot_left = Inches(0.5)
-    plot_top = Inches(1.4)
-    plot_height = Inches(4.0)
-    slide.shapes.add_picture(ev_plot_png, plot_left, plot_top, height=plot_height)
+    title = slide.shapes.title
+    title.text = f"{program_name} EVMS Trend Overview"
 
-    # SPI/CPI table on right
-    m = metrics_df.copy()
-    m = m[m["Metric"].isin(["SPI", "CPI"])]
-    m["Metric"] = pd.Categorical(m["Metric"], categories=["SPI", "CPI"], ordered=True)
-    m = m.sort_values("Metric")
+    # Insert plot
+    pic_left = Inches(0.6)
+    pic_top  = Inches(1.6)
+    pic_height = Inches(3.7)
+    slide.shapes.add_picture(ev_plot_png, pic_left, pic_top, height=pic_height)
 
-    rows = len(m) + 1
+    # Metric table to the right
+    rows = len(metric_df) + 1
     cols = 4
+    table_left = Inches(6.0)
+    table_top  = Inches(1.6)
+    table_width = Inches(3.4)
+    table_height = Inches(1.8)
 
-    tbl_left = Inches(6.0)
-    tbl_top = Inches(1.4)
-    tbl_width = Inches(4.8)
-    tbl_height = Inches(1.8)
+    shape = slide.shapes.add_table(rows, cols, table_left, table_top,
+                                   table_width, table_height)
+    tbl = shape.table
 
-    tbl_shape = slide.shapes.add_table(rows, cols, tbl_left, tbl_top,
-                                       tbl_width, tbl_height)
-    tbl = tbl_shape.table
+    # Column widths – Comments column wider
+    tbl.columns[0].width = Inches(0.9)
+    tbl.columns[1].width = Inches(0.8)
+    tbl.columns[2].width = Inches(0.8)
+    tbl.columns[3].width = Inches(1.9)
 
-    # Column widths (Metric wider, Comments widest)
-    tbl.columns[0].width = Inches(1.3)  # Metric
-    tbl.columns[1].width = Inches(1.1)  # CTD
-    tbl.columns[2].width = Inches(1.1)  # LSD
-    tbl.columns[3].width = Inches(1.3)  # Comments
-
-    headers = ["Metric", "CTD", "LSD", "Comments / Root Cause & Corrective Actions"]
+    # Headers
+    headers = ["Metric","CTD","LSD","Comments / Root Cause & Corrective Actions"]
     for j, h in enumerate(headers):
-        tbl.cell(0, j).text = h
+        cell = tbl.cell(0, j)
+        style_header_cell(cell)
+        cell.text = h
 
-    for i, (_, row) in enumerate(m.iterrows(), start=1):
+    # Body
+    for i, (_, row) in enumerate(metric_df.iterrows(), start=1):
         tbl.cell(i, 0).text = str(row["Metric"])
         tbl.cell(i, 1).text = f"{row['CTD']:.3f}" if pd.notna(row["CTD"]) else ""
         tbl.cell(i, 2).text = f"{row['LSD']:.3f}" if pd.notna(row["LSD"]) else ""
-        tbl.cell(i, 3).text = ""  # comments
+        tbl.cell(i, 3).text = row["Comments / Root Cause & Corrective Actions"]
 
+        for j in range(cols):
+            style_body_cell(tbl.cell(i, j))
 
-def add_subteam_evms_slide(prs, program_name, sub_metrics_df,
-                           page_idx: int, total_pages: int):
-    """Slides: sub-team EVMS metrics (SPI/CPI CTD/LSD)."""
-    layout = prs.slide_layouts[1]
-    slide = prs.slides.add_slide(layout)
-    remove_click_to_add_text_boxes(slide)
+        # Color coding
+        for j, metric_val in enumerate([row["CTD"], row["LSD"]], start=1):
+            rgb = ev_index_color(metric_val)
+            if rgb is not None:
+                cell = tbl.cell(i, j)
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = rgb
 
-    if total_pages > 1:
-        title = f"{program_name} EVMS Detail – Sub Team EVMS Metrics (Page {page_idx+1})"
-    else:
-        title = f"{program_name} EVMS Detail – Sub Team EVMS Metrics"
-    slide.shapes.title.text = title
+def chunk_df(df, size):
+    for start in range(0, len(df), size):
+        yield df.iloc[start:start+size]
 
-    start = page_idx * SUBTEAMS_PER_SLIDE
-    end = (page_idx + 1) * SUBTEAMS_PER_SLIDE
-    sdf = sub_metrics_df.iloc[start:end].reset_index(drop=True)
+def add_subteam_metric_slides(prs, program_name, metrics_df, page_size=15):
+    """
+    Slides: Sub Team EVMS Metrics (SPI/CPI) – may span multiple pages.
+    """
+    if metrics_df.empty:
+        return
 
-    cols = [
-        "Sub Team",
-        "SPI CTD",
-        "SPI LSD",
-        "CPI CTD",
-        "CPI LSD",
-        "Comments / Root Cause & Corrective Actions",
-    ]
+    for page, df_part in enumerate(chunk_df(metrics_df, page_size), start=1):
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        keep_only_title_placeholder(slide)
+        title = slide.shapes.title
+        if len(metrics_df) > page_size:
+            title.text = f"{program_name} EVMS Detail – Sub Team EVMS Metrics (Page {page})"
+        else:
+            title.text = f"{program_name} EVMS Detail – Sub Team EVMS Metrics"
 
-    n_rows = len(sdf) + 1
-    n_cols = len(cols)
+        rows = len(df_part) + 1
+        cols = 6
+        left = Inches(0.6)
+        top  = Inches(1.6)
+        width = Inches(9.0)
+        height = Inches(3.8)
 
-    left = Inches(0.5)
-    top = Inches(1.4)
-    width = Inches(9.5)
-    height = Inches(4.0)
+        shape = slide.shapes.add_table(rows, cols, left, top, width, height)
+        tbl = shape.table
 
-    shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
-    tbl = shape.table
+        # Column widths – last column (Comments) widest
+        tbl.columns[0].width = Inches(1.1)  # Sub Team
+        tbl.columns[1].width = Inches(0.8)
+        tbl.columns[2].width = Inches(0.8)
+        tbl.columns[3].width = Inches(0.8)
+        tbl.columns[4].width = Inches(0.8)
+        tbl.columns[5].width = Inches(2.7)
 
-    # Column widths – comments very wide
-    tbl.columns[0].width = Inches(1.0)
-    tbl.columns[1].width = Inches(1.0)
-    tbl.columns[2].width = Inches(1.0)
-    tbl.columns[3].width = Inches(1.0)
-    tbl.columns[4].width = Inches(1.0)
-    tbl.columns[5].width = Inches(4.5)
+        headers = ["Sub Team","SPI CTD","SPI LSD","CPI CTD","CPI LSD",
+                   "Comments / Root Cause & Corrective Actions"]
+        for j, h in enumerate(headers):
+            cell = tbl.cell(0,j)
+            style_header_cell(cell)
+            cell.text = h
 
-    for j, col in enumerate(cols):
-        tbl.cell(0, j).text = col
+        for i, (_, row) in enumerate(df_part.iterrows(), start=1):
+            tbl.cell(i,0).text = str(row["Sub Team"])
+            tbl.cell(i,1).text = f"{row['SPI CTD']:.3f}" if pd.notna(row["SPI CTD"]) else ""
+            tbl.cell(i,2).text = f"{row['SPI LSD']:.3f}" if pd.notna(row["SPI LSD"]) else ""
+            tbl.cell(i,3).text = f"{row['CPI CTD']:.3f}" if pd.notna(row["CPI CTD"]) else ""
+            tbl.cell(i,4).text = f"{row['CPI LSD']:.3f}" if pd.notna(row["CPI LSD"]) else ""
+            tbl.cell(i,5).text = row["Comments / Root Cause & Corrective Actions"]
 
-    for i, (_, row) in enumerate(sdf.iterrows(), start=1):
-        tbl.cell(i, 0).text = str(row["Sub Team"])
-        for j, col in enumerate(cols[1:-1], start=1):
-            val = row[col]
-            if pd.isna(val):
-                txt = ""
-            else:
-                txt = f"{val:.3f}"
-            tbl.cell(i, j).text = txt
-        tbl.cell(i, n_cols - 1).text = ""  # comments
+            for j in range(cols):
+                style_body_cell(tbl.cell(i,j))
 
+            # Color code SPI/CPI cells
+            for col_name, col_idx in [("SPI CTD",1),("SPI LSD",2),
+                                      ("CPI CTD",3),("CPI LSD",4)]:
+                rgb = ev_index_color(row[col_name])
+                if rgb is not None:
+                    cell = tbl.cell(i,col_idx)
+                    cell.fill.solid()
+                    cell.fill.fore_color.rgb = rgb
 
-def add_labor_manpower_slide(prs, program_name, labor_df, manpower_df,
-                             page_idx: int, total_pages: int):
-    """Slides: subteam labor & manpower (BAC/EAC/VAC + program manpower)."""
-    layout = prs.slide_layouts[1]
-    slide = prs.slides.add_slide(layout)
-    remove_click_to_add_text_boxes(slide)
+def add_labor_manpower_slides(prs, program_name, labor_df, manpower_df, page_size=15):
+    """
+    Slides: Sub Team Labor & Manpower (with Program Manpower at bottom).
+    """
+    if labor_df.empty:
+        return
 
-    if total_pages > 1:
-        title = f"{program_name} EVMS Detail – Sub Team Labor & Manpower (Page {page_idx+1})"
-    else:
-        title = f"{program_name} EVMS Detail – Sub Team Labor & Manpower"
-    slide.shapes.title.text = title
+    for page, df_part in enumerate(chunk_df(labor_df, page_size), start=1):
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        keep_only_title_placeholder(slide)
+        title = slide.shapes.title
+        if len(labor_df) > page_size:
+            title.text = f"{program_name} EVMS Detail – Sub Team Labor & Manpower (Page {page})"
+        else:
+            title.text = f"{program_name} EVMS Detail – Sub Team Labor & Manpower"
 
-    # Slice subteams for this page
-    start = page_idx * SUBTEAMS_PER_SLIDE
-    end = (page_idx + 1) * SUBTEAMS_PER_SLIDE
-    ldf = labor_df.iloc[start:end].reset_index(drop=True)
+        # Top table: Sub Team BAC/EAC/VAC/Comments
+        rows = len(df_part) + 1
+        cols = 5
+        left = Inches(0.6)
+        top  = Inches(1.6)
+        width = Inches(9.0)
+        height = Inches(3.0)
 
-    labor_cols = [
-        "Sub Team",
-        "BAC",
-        "EAC",
-        "VAC",
-        "Comments / Root Cause & Corrective Actions",
-    ]
+        shape = slide.shapes.add_table(rows, cols, left, top, width, height)
+        tbl = shape.table
 
-    n_rows = len(ldf) + 1
-    n_cols = len(labor_cols)
+        tbl.columns[0].width = Inches(1.1)  # Sub Team
+        tbl.columns[1].width = Inches(1.3)
+        tbl.columns[2].width = Inches(1.3)
+        tbl.columns[3].width = Inches(1.3)
+        tbl.columns[4].width = Inches(3.0)  # Comments wider
 
-    top_left = Inches(0.5)
-    top_top = Inches(1.4)
-    top_width = Inches(9.5)
-    top_height = Inches(3.5)
+        headers = ["Sub Team","BAC","EAC","VAC",
+                   "Comments / Root Cause & Corrective Actions"]
+        for j, h in enumerate(headers):
+            cell = tbl.cell(0,j)
+            style_header_cell(cell)
+            cell.text = h
 
-    labor_shape = slide.shapes.add_table(n_rows, n_cols,
-                                         top_left, top_top,
-                                         top_width, top_height)
-    labor_tbl = labor_shape.table
+        for i, (_, row) in enumerate(df_part.iterrows(), start=1):
+            tbl.cell(i,0).text = str(row["Sub Team"])
+            tbl.cell(i,1).text = f"{row['BAC']:.1f}" if pd.notna(row["BAC"]) else ""
+            tbl.cell(i,2).text = f"{row['EAC']:.1f}" if pd.notna(row["EAC"]) else ""
+            tbl.cell(i,3).text = f"{row['VAC']:.1f}" if pd.notna(row["VAC"]) else ""
+            tbl.cell(i,4).text = row["Comments / Root Cause & Corrective Actions"]
 
-    # Column widths – comments very wide
-    labor_tbl.columns[0].width = Inches(1.0)
-    labor_tbl.columns[1].width = Inches(1.4)
-    labor_tbl.columns[2].width = Inches(1.4)
-    labor_tbl.columns[3].width = Inches(1.4)
-    labor_tbl.columns[4].width = Inches(4.3)
+            for j in range(cols):
+                style_body_cell(tbl.cell(i,j))
 
-    for j, col in enumerate(labor_cols):
-        labor_tbl.cell(0, j).text = col
+            rgb = vac_color(row["VAC"], row["BAC"])
+            if rgb is not None:
+                cell = tbl.cell(i,3)
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = rgb
 
-    for i, (_, row) in enumerate(ldf.iterrows(), start=1):
-        labor_tbl.cell(i, 0).text = str(row["Sub Team"])
-        for j, col in enumerate(labor_cols[1:-1], start=1):
-            val = row[col]
-            if pd.isna(val):
-                txt = ""
-            elif isinstance(val, (int, float)):
-                txt = f"{val:,.1f}"
-            else:
-                txt = str(val)
-            labor_tbl.cell(i, j).text = txt
-        labor_tbl.cell(i, n_cols - 1).text = ""
+        # Bottom Program Manpower table, lower so it doesn't overlap
+        mp_rows = len(manpower_df) + 1
+        mp_cols = 6
+        mp_left = Inches(0.6)
+        mp_top  = Inches(4.8)      # << lowered vs previous versions
+        mp_width= Inches(9.0)
+        mp_height = Inches(1.5)
 
-    # Program manpower table, pushed down
-    pm_cols = [
-        "Demand Hours",
-        "Actual Hours",
-        "% Var",
-        "Next Mo BCWS Hours",
-        "Next Mo ETC Hours",
-        "Comments / Root Cause & Corrective Actions",
-    ]
+        shape_mp = slide.shapes.add_table(mp_rows, mp_cols, mp_left, mp_top,
+                                          mp_width, mp_height)
+        mp_tbl = shape_mp.table
 
-    pm_rows = len(manpower_df) + 1
-    pm_cols_n = len(pm_cols)
+        mp_tbl.columns[0].width = Inches(1.5)
+        mp_tbl.columns[1].width = Inches(1.5)
+        mp_tbl.columns[2].width = Inches(1.0)
+        mp_tbl.columns[3].width = Inches(1.5)
+        mp_tbl.columns[4].width = Inches(1.5)
+        mp_tbl.columns[5].width = Inches(2.0)
 
-    pm_left = Inches(0.5)
-    pm_top = top_top + top_height + Inches(0.3)
-    pm_width = Inches(9.5)
-    pm_height = Inches(1.1)
+        headers_mp = ["Demand Hours","Actual Hours","% Var",
+                      "Next Mo BCWS Hours","Next Mo ETC Hours",
+                      "Comments / Root Cause & Corrective Actions"]
+        for j, h in enumerate(headers_mp):
+            cell = mp_tbl.cell(0,j)
+            style_header_cell(cell)
+            cell.text = h
 
-    pm_shape = slide.shapes.add_table(pm_rows, pm_cols_n,
-                                      pm_left, pm_top,
-                                      pm_width, pm_height)
-    pm_tbl = pm_shape.table
+        for i, (_, row) in enumerate(manpower_df.iterrows(), start=1):
+            mp_tbl.cell(i,0).text = f"{row['Demand Hours']:.1f}" if pd.notna(row["Demand Hours"]) else ""
+            mp_tbl.cell(i,1).text = f"{row['Actual Hours']:.1f}" if pd.notna(row["Actual Hours"]) else ""
+            mp_tbl.cell(i,2).text = f"{row['% Var']*100:,.2f}%" if pd.notna(row["% Var"]) else ""
+            mp_tbl.cell(i,3).text = f"{row['Next Mo BCWS Hours']:.1f}" if pd.notna(row["Next Mo BCWS Hours"]) else ""
+            mp_tbl.cell(i,4).text = f"{row['Next Mo ETC Hours']:.1f}" if pd.notna(row["Next Mo ETC Hours"]) else ""
+            mp_tbl.cell(i,5).text = row["Comments / Root Cause & Corrective Actions"]
 
-    for j in range(pm_cols_n - 1):
-        pm_tbl.columns[j].width = Inches(1.3)
-    pm_tbl.columns[pm_cols_n - 1].width = Inches(2.3)
+            for j in range(mp_cols):
+                style_body_cell(mp_tbl.cell(i,j))
 
-    for j, col in enumerate(pm_cols):
-        pm_tbl.cell(0, j).text = col
+            rgb = manpower_var_color(row["% Var"])
+            if rgb is not None:
+                cell = mp_tbl.cell(i,2)
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = rgb
 
-    for i, (_, row) in enumerate(manpower_df.iterrows(), start=1):
-        for j, col in enumerate(pm_cols):
-            val = row[col]
-            if "Comments" in col:
-                pm_tbl.cell(i, j).text = ""
-                continue
-            if pd.isna(val):
-                txt = ""
-            elif isinstance(val, (int, float)):
-                if col == "% Var":
-                    txt = f"{val*100:.2f}%"
-                else:
-                    txt = f"{val:,.1f}"
-            else:
-                txt = str(val)
-            pm_tbl.cell(i, j).text = txt
+# =========================================================
+# MAIN PROGRAM PROCESSOR
+# =========================================================
 
+def load_penske():
+    if not os.path.exists(PENSKE_PATH):
+        return None
+    try:
+        return pd.read_excel(PENSKE_PATH)
+    except Exception:
+        return None
 
-# ------------------------------------------------------------
-# Per-program processing
-# ------------------------------------------------------------
-
-def process_program(program_name: str, cobra_filename: str):
-    cobra_path = os.path.join(DATA_DIR, cobra_filename)
+def process_program(program_name, cobra_file, penske_df):
+    cobra_path = os.path.join(COBRA_DIR, cobra_file)
     if not os.path.exists(cobra_path):
         raise FileNotFoundError(f"Cobra file not found: {cobra_path}")
 
-    print(f"\n=== Processing {program_name} from {cobra_filename} ===")
+    print(f"\n--- Processing {program_name} from {cobra_file} ---")
 
-    raw = pd.read_excel(cobra_path)
-    cobra = normalize_cobra_columns(raw)
+    cobra_df = normalize_cobra_standard(cobra_path)
 
-    evdf = compute_ev_timeseries(cobra)
-    metrics_df, ctd_date, lsd_date = build_program_metric_table(evdf)
-    sub_metrics_df = build_subteam_metric_table(cobra, ctd_date, lsd_date)
-    labor_df = build_labor_table(cobra)
-    manpower_df = build_manpower_table(cobra)
+    evdf = compute_ev_timeseries(cobra_df)
+    ctd_date, lsd_date = get_status_date(evdf)
+    metric_df = build_program_metric_table(evdf, ctd_date, lsd_date)
+    sub_metrics_df = build_subteam_metric_table(cobra_df, ctd_date, lsd_date)
+    labor_df = build_labor_table(cobra_df)
+    manpower_df = build_manpower_table(penske_df, program_name)
 
-    # Plot
-    ev_plot_png = os.path.join(OUTPUT_DIR, f"{program_name}_EV_Plot.png")
-    make_ev_plot(evdf, program_name, ev_plot_png)
+    print(f"✓ CTD date: {ctd_date.date()}, LSD date: {lsd_date.date()}")
+    print(metric_df)
 
-    # Tables workbook
+    # Build plot
+    ev_plot_png = os.path.join(OUTPUT_DIR, f"{program_name}_EVMS_Trend.png")
+    make_evms_plot(evdf, program_name, ev_plot_png)
+
+    # Build deck from theme
+    prs = Presentation(THEME_PATH)
+
+    # Slides in order:
+    # 1. Program Overview (EV plot + metrics)
+    add_program_overview_slide(prs, program_name, ev_plot_png, metric_df)
+
+    # 2. Sub Team EVMS Metrics (may be multi-page)
+    add_subteam_metric_slides(prs, program_name, sub_metrics_df, page_size=15)
+
+    # 3. Sub Team Labor & Manpower (may be multi-page)
+    add_labor_manpower_slides(prs, program_name, labor_df, manpower_df, page_size=15)
+
+    # Save Excel tables
     tables_xlsx = os.path.join(OUTPUT_DIR, f"{program_name}_EVMS_Tables.xlsx")
     with pd.ExcelWriter(tables_xlsx, engine="xlsxwriter") as writer:
-        evdf.to_excel(writer, sheet_name="EV_Series", index=False)
-        metrics_df.to_excel(writer, sheet_name="Program_Metrics", index=False)
-        sub_metrics_df.to_excel(writer, sheet_name="Subteam_EVMS", index=False)
+        evdf.to_excel(writer, sheet_name="EV_Series")
+        metric_df.to_excel(writer, sheet_name="Program_Metrics", index=False)
+        sub_metrics_df.to_excel(writer, sheet_name="Subteam_Metrics", index=False)
         labor_df.to_excel(writer, sheet_name="Subteam_Labor", index=False)
         manpower_df.to_excel(writer, sheet_name="Program_Manpower", index=False)
-
-    # Deck using Theme.pptx
-    if os.path.exists(THEME_PATH):
-        prs = Presentation(THEME_PATH)
-    else:
-        prs = Presentation()
-
-    # 1) Overview slide
-    add_overview_slide(prs, program_name, ev_plot_png, metrics_df, ctd_date, lsd_date)
-
-    # 2) Sub-team EVMS detail slides
-    n_ev_pages = max(1, math.ceil(len(sub_metrics_df) / SUBTEAMS_PER_SLIDE))
-    for page_idx in range(n_ev_pages):
-        add_subteam_evms_slide(prs, program_name, sub_metrics_df,
-                               page_idx, n_ev_pages)
-
-    # 3) Sub-team labor & manpower slides
-    n_labor_pages = max(1, math.ceil(len(labor_df) / SUBTEAMS_PER_SLIDE))
-    for page_idx in range(n_labor_pages):
-        add_labor_manpower_slide(prs, program_name, labor_df, manpower_df,
-                                 page_idx, n_labor_pages)
 
     out_pptx = os.path.join(OUTPUT_DIR, f"{program_name}_EVMS_Deck.pptx")
     prs.save(out_pptx)
 
-    print(f"✓ CTD date: {ctd_date.date()}, LSD date: {lsd_date.date()}")
     print(f"✓ Saved tables: {tables_xlsx}")
     print(f"✓ Saved deck:   {out_pptx}")
 
+# =========================================================
+# RUN ALL STANDARD-FORMAT PROGRAMS
+# =========================================================
 
-# ------------------------------------------------------------
-# Run all standard-format programs
-# ------------------------------------------------------------
-
+penske_df = load_penske()
 program_errors = {}
 
 for program, cobra_file in PROGRAM_CONFIG.items():
     try:
-        process_program(program, cobra_file)
+        process_program(program, cobra_file, penske_df)
     except Exception as e:
         print(f"!! Error for {program}: {e}")
         program_errors[program] = str(e)
@@ -668,4 +757,4 @@ print("\nALL STANDARD-FORMAT PROGRAM EVMS DECKS COMPLETE ✓")
 if program_errors:
     print("\nPrograms needing re-export / clarification (not processed):")
     for prog, msg in program_errors.items():
-        print(f"- {prog}: {msg}")
+        print(f" - {prog}: {msg}")
