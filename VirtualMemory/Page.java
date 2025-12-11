@@ -1,25 +1,6 @@
 # ============================================================
-# EVMS PowerPoint Generator – Multi-Program Cobra Pipeline
+# EVMS PowerPoint Generator – All Cobra Programs (Updated)
 # ============================================================
-#
-# What this does:
-#  - Loads multiple Cobra exports (different formats)
-#  - Normalizes key columns (SUB_TEAM, COSTSET, DATE, HOURS)
-#  - Computes monthly + cumulative CPI/SPI from Cobra
-#  - Creates EVMS plots (0.75–1.25 y-axis, outliers removed in plot)
-#  - Builds PowerPoint decks per program with:
-#       Slide 1: EVMS Trend Overview + SPI/CPI/BEI table
-#       Slide 2+: Sub Team CPI/SPI metrics
-#       Slide 3+: Sub Team Labor & Manpower + Program Manpower
-#  - Formatting tweaks:
-#       * Metric column on Slide 1 is wider
-#       * Program Manpower table is pushed lower so it doesn’t overlap
-#
-# Notes:
-#  - You will still need to plug in your exact thresholds if they differ.
-#  - BEI is left as NaN here (it typically comes from schedule / Penske);
-#    you can merge that in later if you want.
-#  - Any numeric VAC / % Var / CPI / SPI cell is colored; NaN stays gray.
 
 import os
 from datetime import datetime
@@ -37,12 +18,11 @@ from pptx.dml.color import RGBColor
 # --------------------------
 DATA_DIR   = "data"
 OUTPUT_DIR = "EVMS_Output"
-TEMPLATE_PPTX = os.path.join(DATA_DIR, "Theme.pptx")  # use your corporate template if you have it
+TEMPLATE_PPTX = os.path.join(DATA_DIR, "Theme.pptx")  # your GDLS template, if present
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Cobra files to include in the pipeline
-# (You can add/remove entries as needed.)
+# ALL Cobra files you want to process
 COBRA_FILES = [
     "Cobra-Abrams STS 2022.xlsx",
     "Cobra-Abrams STS.xlsx",
@@ -63,31 +43,32 @@ COBRA_FILES = [
     "John G Weekly CAP OLY 12.07.2025.xlsx",
 ]
 
-# Programs we want to build decks for, mapped to Cobra file
-# (Keep the program names how you want them to appear in slide titles.)
+# Derive a program name from file name automatically
+def program_name_from_file(fname: str) -> str:
+    base = os.path.splitext(fname)[0]
+    base = base.replace("Cobra-", "").strip()
+    base = base.replace(" ", "_")
+    return base
+
+# Build PROGRAM_CONFIG for ALL files
 PROGRAM_CONFIG = {
-    "Abrams_STS_2022": "Cobra-Abrams STS 2022.xlsx",
-    "Abrams_STS":      "Cobra-Abrams STS.xlsx",
-    "XM30":            "Cobra-XM30.xlsx",
-    # Add more program→file mappings here as needed
+    program_name_from_file(f): f
+    for f in COBRA_FILES
 }
 
-# EV index thresholds (you can tune these)
+# EV index thresholds (roughly your bands)
 EV_BLUE_MIN   = 1.05
 EV_GREEN_MIN  = 0.98
 EV_YELLOW_MIN = 0.95
-# Red: below yellow
 
 # Manpower % Var thresholds
 MP_GREEN_MIN  = 0.90
 MP_YELLOW_MIN = 0.80
-# Red below yellow
 
-# VAC thresholds (as % of BAC)
+# VAC thresholds as % of BAC
 VAC_BLUE_MIN   = 0.05
 VAC_GREEN_MIN  = 0.01
 VAC_YELLOW_MIN = -0.01
-# Red below yellow
 
 
 # ============================================================
@@ -95,36 +76,43 @@ VAC_YELLOW_MIN = -0.01
 # ============================================================
 
 def _find_column(df, candidates, contains_any=None):
-    """
-    Find a column in df given a list of exact candidates OR a list of substrings.
-    Returns column name or None.
-    """
     cols = list(df.columns)
-
-    # 1) exact candidates
+    # exact candidates
     for cand in candidates:
         if cand in cols:
             return cand
-
-    # 2) contains substrings
+    # substring search
     if contains_any:
-        lowered = {c: c.lower() for c in cols}
-        for col, low in lowered.items():
+        for col in cols:
+            low = str(col).lower()
             if any(sub.lower() in low for sub in contains_any):
                 return col
-
     return None
 
 
-def normalize_cobra(df_raw):
+def standardize_costset(value):
     """
-    Normalize different Cobra export formats to a standard schema:
+    Map a variety of Cobra COST-SET strings into standard codes:
+      BCWS, BCWP, ACWP, ETC, other.
+    """
+    s = str(value).upper()
+    if "BCWS" in s:
+        return "BCWS"
+    if "BCWP" in s:
+        return "BCWP"
+    if "ACWP" in s:
+        return "ACWP"
+    if "ETC" in s:
+        return "ETC"
+    return s  # leave others as-is
+
+
+def normalize_cobra(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize different Cobra export formats to:
         SUBTEAM, COSTSET, DATE, HOURS
-    Drop rows where required fields are missing.
     """
     df = df_raw.copy()
-
-    # Standardize column names a bit
     df.columns = [str(c).strip() for c in df.columns]
 
     subteam_col = _find_column(
@@ -150,7 +138,7 @@ def normalize_cobra(df_raw):
 
     if any(c is None for c in [subteam_col, costset_col, date_col, hours_col]):
         missing = [name for name, val in [
-            ("SUB_TEAM", subteam_col),
+            ("SUBTEAM", subteam_col),
             ("COSTSET", costset_col),
             ("DATE", date_col),
             ("HOURS", hours_col),
@@ -166,11 +154,14 @@ def normalize_cobra(df_raw):
     }
     df = df.rename(columns=rename_map)
 
-    # Coerce types
+    # Standardize COSTSET
+    df["COSTSET"] = df["COSTSET"].map(standardize_costset)
+
+    # Types
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
     df["HOURS"] = pd.to_numeric(df["HOURS"], errors="coerce")
 
-    # Drop rows with no key fields
+    # Drop unusable rows
     df = df.dropna(subset=["DATE", "HOURS", "COSTSET"])
 
     return df[["SUBTEAM", "COSTSET", "DATE", "HOURS"]]
@@ -180,54 +171,35 @@ def normalize_cobra(df_raw):
 # EV time-series from Cobra
 # ============================================================
 
-def compute_ev_timeseries(cobra_df, costset_map=None):
+def compute_ev_timeseries(cobra_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute EV time-series from a normalized Cobra dataframe.
-
-    Parameters
-    ----------
-    cobra_df : DataFrame with SUBTEAM, COSTSET, DATE, HOURS
-    costset_map : optional dict to remap text cost sets, e.g.
-                  {'BCWS HOURS': 'BCWS', 'BCWP HOURS': 'BCWP', ...}
-
-    Returns
-    -------
-    ev : DataFrame indexed by month (period end) with columns:
-         BCWS, BCWP, ACWP,
-         CPI_month, SPI_month,
-         CPI_cum, SPI_cum
+    Compute EV time-series from normalized Cobra data.
+    Returns a DataFrame indexed by month-end with:
+        BCWS, BCWP, ACWP,
+        CPI_month, SPI_month,
+        CPI_cum, SPI_cum
     """
     df = cobra_df.copy()
-    if costset_map:
-        df["COSTSET"] = df["COSTSET"].replace(costset_map)
 
-    # Keep only EV-relevant rows
-    keep = df["COSTSET"].isin(["BCWS", "BCWP", "ACWP"])
-    df = df[keep]
-
+    df = df[df["COSTSET"].isin(["BCWS", "BCWP", "ACWP"])]
     if df.empty:
         raise ValueError("No BCWS/BCWP/ACWP rows found after filtering COSTSET")
 
-    # Aggregate by period end (month-end, 'ME' to avoid deprecated 'M')
-    df["DATE"] = pd.to_datetime(df["DATE"])
-    df = df.set_index("DATE")
-
+    df = df.set_index(pd.to_datetime(df["DATE"]))
     monthly = (
-        df.groupby(["COSTSET"])
-          .resample("ME")["HOURS"]
+        df.groupby("COSTSET")
+          .resample("ME")["HOURS"]  # 'ME' = month-end, avoids deprecated 'M'
           .sum()
           .unstack(0)
           .sort_index()
     )
 
-    # Ensure columns exist
     for col in ["BCWS", "BCWP", "ACWP"]:
         if col not in monthly.columns:
             monthly[col] = 0.0
 
     monthly = monthly[["BCWS", "BCWP", "ACWP"]].fillna(0.0)
 
-    # Monthly indices (avoid div by 0)
     monthly["CPI_month"] = np.where(
         monthly["ACWP"] > 0, monthly["BCWP"] / monthly["ACWP"], np.nan
     )
@@ -235,7 +207,6 @@ def compute_ev_timeseries(cobra_df, costset_map=None):
         monthly["BCWS"] > 0, monthly["BCWP"] / monthly["BCWS"], np.nan
     )
 
-    # Cumulative
     monthly["BCWS_cum"] = monthly["BCWS"].cumsum()
     monthly["BCWP_cum"] = monthly["BCWP"].cumsum()
     monthly["ACWP_cum"] = monthly["ACWP"].cumsum()
@@ -258,39 +229,35 @@ def compute_ev_timeseries(cobra_df, costset_map=None):
 # Plotting
 # ============================================================
 
+def clipped(series, lo=0.75, hi=1.25):
+    return series.where((series >= lo) & (series <= hi), np.nan)
+
+
 def create_evms_plot(ev_df, program_name, out_png):
     """
-    Create EVMS trend plot with color bands, 0.75–1.25 y-axis,
-    and outliers removed from the plotted series.
+    EVMS trend plot with bands, 0.75–1.25 range, outliers removed.
     """
     if ev_df.empty:
-        raise ValueError("EV time-series is empty – cannot plot")
+        raise ValueError("EV time-series is empty")
 
-    # Convert index to timestamps if needed
     x = ev_df.index.to_timestamp() if isinstance(ev_df.index, pd.PeriodIndex) else ev_df.index
 
-    # Values (we'll clip to 0.75–1.25 for plotting)
-    def clipped(series):
-        return series.where((series >= 0.75) & (series <= 1.25), np.nan)
-
-    CPI_m  = clipped(ev_df["CPI_month"])
-    SPI_m  = clipped(ev_df["SPI_month"])
-    CPI_c  = clipped(ev_df["CPI_cum"])
-    SPI_c  = clipped(ev_df["SPI_cum"])
+    CPI_m = clipped(ev_df["CPI_month"])
+    SPI_m = clipped(ev_df["SPI_month"])
+    CPI_c = clipped(ev_df["CPI_cum"])
+    SPI_c = clipped(ev_df["SPI_cum"])
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    # Color bands
-    ax.axhspan(0.75, 0.95, facecolor="#ffcccc", alpha=0.6)  # red
-    ax.axhspan(0.95, 0.98, facecolor="#fff2cc", alpha=0.6)  # yellow
-    ax.axhspan(0.98, 1.05, facecolor="#c6efce", alpha=0.6)  # green
-    ax.axhspan(1.05, 1.25, facecolor="#c9daf8", alpha=0.6)  # blue
+    # bands
+    ax.axhspan(0.75, 0.95, facecolor="#ffcccc", alpha=0.6)   # red
+    ax.axhspan(0.95, 0.98, facecolor="#fff2cc", alpha=0.6)   # yellow
+    ax.axhspan(0.98, 1.05, facecolor="#c6efce", alpha=0.6)   # green
+    ax.axhspan(1.05, 1.25, facecolor="#c9daf8", alpha=0.6)   # blue
 
-    # Monthly scatter
     ax.scatter(x, CPI_m, s=20, label="Monthly CPI", color="black")
     ax.scatter(x, SPI_m, s=20, label="Monthly SPI", color="gold")
 
-    # Cumulative lines
     ax.plot(x, CPI_c, label="Cumulative CPI", linewidth=2, color="blue")
     ax.plot(x, SPI_c, label="Cumulative SPI", linewidth=2, color="dimgray")
 
@@ -298,29 +265,27 @@ def create_evms_plot(ev_df, program_name, out_png):
     ax.set_ylabel("EV Indices")
     ax.set_xlabel("Month")
     ax.set_title(f"{program_name} EVMS Trend Overview")
-
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(True, axis="y", alpha=0.3)
-
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
 
 
 # ============================================================
-# Color helpers for tables
+# Color helpers
 # ============================================================
 
 def ev_index_color(value):
     if pd.isna(value):
         return None
     if value >= EV_BLUE_MIN:
-        return RGBColor(0, 112, 192)   # blue
+        return RGBColor(0, 112, 192)
     if value >= EV_GREEN_MIN:
-        return RGBColor(0, 176, 80)    # green
+        return RGBColor(0, 176, 80)
     if value >= EV_YELLOW_MIN:
-        return RGBColor(255, 192, 0)   # yellow
-    return RGBColor(192, 0, 0)         # red
+        return RGBColor(255, 192, 0)
+    return RGBColor(192, 0, 0)
 
 
 def vac_color(vac, bac):
@@ -347,23 +312,13 @@ def manpower_var_color(var_ratio):
 
 
 # ============================================================
-# Sub-team tables (CPI/SPI + Labor/Manpower)
+# Subteam tables
 # ============================================================
 
 def build_subteam_metric_table(cobra_df, ev_df, curr_date):
-    """
-    Build sub-team CPI/SPI CTD/LSD table from Cobra + EV series.
-    For now, this uses cumulative CPI/SPI at CTD and LSD,
-    same values for all subteams (since we don't yet have
-    subteam-level EV series from Cobra).
-    """
-    if ev_df.empty:
-        raise ValueError("EV DF empty")
-
     dates = ev_df.index[ev_df.index <= curr_date]
     if len(dates) == 0:
         raise ValueError("No EV dates <= CTD")
-
     ctd_date = dates.max()
     lsd_date = dates[dates < ctd_date].max() if len(dates) > 1 else ctd_date
 
@@ -389,20 +344,11 @@ def build_subteam_metric_table(cobra_df, ev_df, curr_date):
             }
         )
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 def build_labor_manpower_tables(cobra_df):
-    """
-    Build:
-      - Sub Team Labor (BAC, EAC, VAC)
-      - Program Manpower (Demand, Actual, % Var, Next Month BCWS/ETC as placeholders)
-    from Cobra HOURS by SUBTEAM and COSTSET.
-    """
     df = cobra_df.copy()
-    # Aggregate BAC (BCWS), EAC (BCWS + ETC), VAC (BAC - EAC) *placeholder logic*
-    # For now, treat BCWS as BAC, ACWP as Actual, ETC if present.
     agg = df.pivot_table(
         index="SUBTEAM",
         columns="COSTSET",
@@ -411,9 +357,9 @@ def build_labor_manpower_tables(cobra_df):
         fill_value=0.0,
     )
 
-    bac = agg.get("BCWS", pd.Series(0.0, index=agg.index))
+    bac  = agg.get("BCWS", pd.Series(0.0, index=agg.index))
     acwp = agg.get("ACWP", pd.Series(0.0, index=agg.index))
-    etc = agg.get("ETC", pd.Series(0.0, index=agg.index))
+    etc  = agg.get("ETC",  pd.Series(0.0, index=agg.index))
 
     eac = acwp + etc
     vac = bac - eac
@@ -429,15 +375,12 @@ def build_labor_manpower_tables(cobra_df):
                 "Comments / Root Cause & Corrective Actions": "",
             }
         )
-
     labor_df = pd.DataFrame(labor_rows)
 
-    # Drop rows that are completely zero in numeric cols
     num_cols = ["BAC", "EAC", "VAC"]
     mask_nonzero = (labor_df[num_cols].abs().sum(axis=1) > 0)
     labor_df = labor_df[mask_nonzero].reset_index(drop=True)
 
-    # Program manpower summary
     demand_hours = bac.sum()
     actual_hours = acwp.sum()
     pct_var = actual_hours / demand_hours if demand_hours > 0 else np.nan
@@ -448,8 +391,8 @@ def build_labor_manpower_tables(cobra_df):
                 "Demand Hours": float(demand_hours),
                 "Actual Hours": float(actual_hours),
                 "% Var": pct_var,
-                "Next Mo BCWS Hours": 0.0,  # placeholder
-                "Next Mo ETC Hours": 0.0,   # placeholder
+                "Next Mo BCWS Hours": 0.0,
+                "Next Mo ETC Hours": 0.0,
                 "Comments / Root Cause & Corrective Actions": "",
             }
         ]
@@ -459,64 +402,77 @@ def build_labor_manpower_tables(cobra_df):
 
 
 # ============================================================
-# PPTX helpers
+# PPTX helpers (with robust layout + formatting tweaks)
 # ============================================================
 
-def add_title(prs, text):
-    slide_layout = prs.slide_layouts[5]  # title only / blank-ish
+def get_title_layout_index(prs: Presentation) -> int:
+    """
+    Try to find a simple title-only or title slide layout.
+    Fallback to 0 if we can't guess.
+    """
+    for idx, layout in enumerate(prs.slide_layouts):
+        name = layout.name.lower()
+        if "title" in name and "content" not in name:
+            return idx
+    return 0  # safe default
+
+
+def add_title_slide(prs: Presentation, text: str):
+    layout_idx = get_title_layout_index(prs)
+    slide_layout = prs.slide_layouts[layout_idx]
     slide = prs.slides.add_slide(slide_layout)
-    title = slide.shapes.title
-    if title is None:
-        title = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.6)).text_frame
-        title = title.paragraphs[0]
-    title.text = text
+    if slide.shapes.title:
+        slide.shapes.title.text = text
+    else:
+        tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.6))
+        p = tb.text_frame.paragraphs[0]
+        p.text = text
+        p.font.size = Pt(24)
     return slide
 
 
 def autofit_table_font(tbl, size=11):
     for row in tbl.rows:
         for cell in row.cells:
+            if not cell.text_frame:
+                continue
             for p in cell.text_frame.paragraphs:
                 for run in p.runs:
                     run.font.size = Pt(size)
 
 
 def add_metric_table(slide, metrics_df):
-    """
-    Add SPI/CPI/BEI CTD/LSD table to overview slide.
-    Metric column is made a bit wider.
-    """
     rows, cols = metrics_df.shape[0] + 1, metrics_df.shape[1]
 
     left = Inches(6.2)
     top = Inches(1.5)
-    width = Inches(3.0)
-    height = Inches(1.5)
+    width = Inches(3.3)   # a bit wider
+    height = Inches(1.6)
 
     shape = slide.shapes.add_table(rows, cols, left, top, width, height)
     tbl = shape.table
 
-    # Header
+    # headers
     for j, col in enumerate(metrics_df.columns):
         tbl.cell(0, j).text = col
 
-    # Rows
+    # rows
     for i, (_, row) in enumerate(metrics_df.iterrows(), start=1):
         for j, col in enumerate(metrics_df.columns):
             val = row[col]
-            tbl.cell(i, j).text = "" if pd.isna(val) else f"{val:.3f}" if isinstance(val, (float, int)) else str(val)
+            if isinstance(val, (float, int)):
+                tbl.cell(i, j).text = f"{val:.3f}"
+            else:
+                tbl.cell(i, j).text = "" if pd.isna(val) else str(val)
 
-    # Formatting
     autofit_table_font(tbl, size=10)
 
-    # Widen Metric col
-    tbl.columns[0].width = Inches(1.2)
+    # widen Metric column more for readability
+    tbl.columns[0].width = Inches(1.4)
 
-    # Color CTD/LSD cells
-    metric_col = metrics_df.columns.get_loc("Metric")
-    ctd_col    = metrics_df.columns.get_loc("CTD")
-    lsd_col    = metrics_df.columns.get_loc("LSD")
-
+    # color CTD/LSD
+    ctd_col = metrics_df.columns.get_loc("CTD")
+    lsd_col = metrics_df.columns.get_loc("LSD")
     for i in range(1, rows):
         for j in [ctd_col, lsd_col]:
             txt = tbl.cell(i, j).text
@@ -530,11 +486,8 @@ def add_metric_table(slide, metrics_df):
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = rgb
 
-    return tbl
-
 
 def add_evms_overview_slide(prs, program_name, ev_df, plot_png):
-    # Metric values at CTD/LSD
     dates = ev_df.index
     ctd_date = dates.max()
     lsd_date = dates[dates < ctd_date].max() if len(dates) > 1 else ctd_date
@@ -542,6 +495,7 @@ def add_evms_overview_slide(prs, program_name, ev_df, plot_png):
     row_ctd = ev_df.loc[ctd_date]
     row_lsd = ev_df.loc[lsd_date]
 
+    # Ignore BEI for now (leave blank, to be wired to Penske later)
     metrics_df = pd.DataFrame(
         [
             {"Metric": "SPI", "CTD": row_ctd["SPI_cum"], "LSD": row_lsd["SPI_cum"], "Comments / Root Cause & Corrective Actions": ""},
@@ -550,44 +504,37 @@ def add_evms_overview_slide(prs, program_name, ev_df, plot_png):
         ]
     )
 
-    slide = add_title(prs, f"{program_name} EVMS Trend Overview")
+    slide = add_title_slide(prs, f"{program_name} EVMS Trend Overview")
 
-    # Plot image
+    # plot image
     left = Inches(0.6)
     top = Inches(1.3)
     slide.shapes.add_picture(plot_png, left, top, height=Inches(3.5))
 
-    # Metric table (with wider Metric col)
     add_metric_table(slide, metrics_df[["Metric", "CTD", "LSD", "Comments / Root Cause & Corrective Actions"]])
-
-    return slide
 
 
 def chunk_list(seq, n):
     for i in range(0, len(seq), n):
-        yield seq[i : i + n]
+        yield seq[i: i + n]
 
 
 def add_subteam_metric_slides(prs, program_name, metrics_df):
-    """
-    Add Sub Team CPI/SPI metric slides (15 subteams per slide).
-    """
-    for chunk in chunk_list(metrics_df, 15):
-        slide = add_title(prs, f"{program_name} EVMS Detail – Sub Team CPI / SPI Metrics")
+    for chunk in chunk_list(metrics_df, 15):  # 15 per slide
+        slide = add_title_slide(prs, f"{program_name} EVMS Detail – Sub Team CPI / SPI Metrics")
+
         rows, cols = chunk.shape[0] + 1, chunk.shape[1]
         left = Inches(0.6)
-        top = Inches(1.3)
+        top  = Inches(1.3)
         width = Inches(9.0)
         height = Inches(4.0)
 
         shape = slide.shapes.add_table(rows, cols, left, top, width, height)
         tbl = shape.table
 
-        # Headers
         for j, col in enumerate(chunk.columns):
             tbl.cell(0, j).text = col
 
-        # Rows
         for i, (_, row) in enumerate(chunk.iterrows(), start=1):
             for j, col in enumerate(chunk.columns):
                 val = row[col]
@@ -598,16 +545,15 @@ def add_subteam_metric_slides(prs, program_name, metrics_df):
 
         autofit_table_font(tbl, size=9)
 
-        # Color SPI/CPI cells
         for i in range(1, rows):
             for col_name in ["SPI LSD", "SPI CTD", "CPI LSD", "CPI CTD"]:
                 j = chunk.columns.get_loc(col_name)
                 txt = tbl.cell(i, j).text
                 try:
-                    val = float(txt)
+                    v = float(txt)
                 except ValueError:
-                    val = np.nan
-                rgb = ev_index_color(val)
+                    v = np.nan
+                rgb = ev_index_color(v)
                 if rgb is not None:
                     cell = tbl.cell(i, j)
                     cell.fill.solid()
@@ -615,14 +561,10 @@ def add_subteam_metric_slides(prs, program_name, metrics_df):
 
 
 def add_labor_manpower_slides(prs, program_name, labor_df, manpower_df):
-    """
-    Add Sub Team Labor & Manpower slides (15 subteams per slide)
-    with Program Manpower table placed lower on the slide.
-    """
-    for chunk in chunk_list(labor_df, 15):
-        slide = add_title(prs, f"{program_name} EVMS Detail – Sub Team Labor & Manpower")
+    for chunk in chunk_list(labor_df, 15):  # 15 subteams per slide
+        slide = add_title_slide(prs, f"{program_name} EVMS Detail – Sub Team Labor & Manpower")
 
-        # Sub Team Labor table
+        # main labor table
         rows, cols = chunk.shape[0] + 1, chunk.shape[1]
         left = Inches(0.6)
         top  = Inches(1.3)
@@ -648,10 +590,9 @@ def add_labor_manpower_slides(prs, program_name, labor_df, manpower_df):
 
         autofit_table_font(tbl, size=9)
 
-        # Color VAC cells based on % of BAC, and ensure any numeric has a color (no random gray)
+        # VAC colors
         bac_idx = chunk.columns.get_loc("BAC")
         vac_idx = chunk.columns.get_loc("VAC")
-
         for i in range(1, rows):
             try:
                 bac_val = float(tbl.cell(i, bac_idx).text.replace(",", ""))
@@ -661,20 +602,17 @@ def add_labor_manpower_slides(prs, program_name, labor_df, manpower_df):
                 vac_val = float(tbl.cell(i, vac_idx).text.replace(",", ""))
             except ValueError:
                 vac_val = np.nan
-
             rgb = vac_color(vac_val, bac_val)
             if rgb is None and not pd.isna(vac_val):
-                # Default to light blue if numeric but no threshold matched
                 rgb = RGBColor(221, 235, 247)
-
             if rgb is not None:
                 cell = tbl.cell(i, vac_idx)
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = rgb
 
-        # Program Manpower table – placed LOWER so it doesn't overlap
+        # Program Manpower table – LOWER so it doesn't overlap
         mp_left = Inches(0.6)
-        mp_top  = Inches(5.1)   # lower than before
+        mp_top  = Inches(5.4)   # <<< slightly lower than before
         mp_width = Inches(9.0)
         mp_height = Inches(1.0)
 
@@ -700,7 +638,7 @@ def add_labor_manpower_slides(prs, program_name, labor_df, manpower_df):
 
         autofit_table_font(mp_tbl, size=9)
 
-        # Color % Var
+        # % Var colors
         var_idx = manpower_df.columns.get_loc("% Var")
         for i in range(1, mp_rows):
             txt = mp_tbl.cell(i, var_idx).text.replace("%", "").strip()
@@ -716,14 +654,14 @@ def add_labor_manpower_slides(prs, program_name, labor_df, manpower_df):
 
 
 # ============================================================
-# Main pipeline
+# Main driver
 # ============================================================
 
 def process_program(program_name, cobra_file):
     print(f"\n=== Processing {program_name} from {cobra_file} ===")
     path = os.path.join(DATA_DIR, cobra_file)
     if not os.path.exists(path):
-        print(f"  >> Skipping: file not found: {path}")
+        print(f"  >> Skipping – file not found: {path}")
         return
 
     raw = pd.read_excel(path)
@@ -731,31 +669,24 @@ def process_program(program_name, cobra_file):
 
     ev = compute_ev_timeseries(cobra)
 
-    # Plot
     plot_png = os.path.join(OUTPUT_DIR, f"{program_name}_EVMS_Plot.png")
     create_evms_plot(ev, program_name, plot_png)
 
-    # Subteam tables
     curr_date = ev.index.max()
     metrics_sub = build_subteam_metric_table(cobra, ev, curr_date)
     labor_df, manpower_df = build_labor_manpower_tables(cobra)
 
-    # Build PPTX deck
+    # start presentation
     if os.path.exists(TEMPLATE_PPTX):
         prs = Presentation(TEMPLATE_PPTX)
     else:
         prs = Presentation()
 
-    # Slide 1
     add_evms_overview_slide(prs, program_name, ev, plot_png)
-
-    # Slide 2+ (subteam metrics)
     add_subteam_metric_slides(prs, program_name, metrics_sub)
-
-    # Labor & manpower slides (last)
     add_labor_manpower_slides(prs, program_name, labor_df, manpower_df)
 
-    # Save tables to Excel as well
+    # Save tables
     tables_xlsx = os.path.join(OUTPUT_DIR, f"{program_name}_EVMS_Tables.xlsx")
     with pd.ExcelWriter(tables_xlsx, engine="xlsxwriter") as writer:
         ev.to_excel(writer, sheet_name="EV_Series")
@@ -771,7 +702,7 @@ def process_program(program_name, cobra_file):
     print(f"  ✓ Saved deck:   {out_pptx}")
 
 
-# Run for all configured programs
+# Run for all config’d programs (ALL Cobra files)
 for program, cobra_file in PROGRAM_CONFIG.items():
     try:
         process_program(program, cobra_file)
